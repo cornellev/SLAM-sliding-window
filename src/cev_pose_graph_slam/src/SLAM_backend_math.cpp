@@ -164,7 +164,9 @@ private:
         double rotation_dist = std::abs(wrapAngle(cur_th - last.th));
 
         if (travel_dist > 0.3 || rotation_dist > 0.26) {
-            Eigen::Vector3d z(cur_x - last.x, cur_y - last.y, wrapAngle(cur_th - last.th));
+            double c = std::cos(last.th), s = std::sin(last.th);
+            double dx = cur_x - last.x, dy = cur_y - last.y;
+            Eigen::Vector3d z(c*dx + s*dy, -s*dx + c*dy, wrapAngle(cur_th - last.th));
             W_.push_back({cur_x, cur_y, cur_th});
 
             Eigen::Matrix3d info = Eigen::Matrix3d::Identity();
