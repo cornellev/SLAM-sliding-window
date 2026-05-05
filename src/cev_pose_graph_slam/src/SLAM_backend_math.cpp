@@ -5,6 +5,10 @@
 #include <iostream>
 #include <vector>
 #include <memory>
+#include <deque>
+#include <algorithm>
+
+static constexpr int WINDOW_SIZE = 20;
 
 #include "rclcpp/rclcpp.hpp"
 #include "nav_msgs/msg/odometry.hpp"
@@ -70,8 +74,9 @@ static inline void applyIncrement(Pose2& x, const Eigen::Vector3d& dx) {
     x.th = wrapAngle(x.th + dx[2]);
 }
 
-bool gaussNewtonStep(std::vector<Pose2>& X, const std::vector<Edge2>& edges, double damping = 0.0) {
-    const int N = static_cast<int>(X.size());
+bool gaussNewtonStep(std::deque<Pose2>& W, const std::vector<Edge2>& edges, double damping = 0.0) {
+    if (W.size() < 2) return false;
+    const int N = static_cast<int>(W.size());
     const int D = 3 * N;
     std::vector<Eigen::Triplet<double>> trips;
     Eigen::VectorXd b = Eigen::VectorXd::Zero(D);
@@ -85,8 +90,8 @@ bool gaussNewtonStep(std::vector<Pose2>& X, const std::vector<Edge2>& edges, dou
 
     double chi2 = 0.0;
     for (const auto& e : edges) {
-        const Pose2& xi = X[e.i];
-        const Pose2& xj = X[e.j];
+        const Pose2& xi = W[e.i];
+        const Pose2& xj = W[e.j];
         Eigen::Vector3d err = computeError(xi, xj, e.z);
         chi2 += err.transpose() * e.Omega * err;
         Eigen::Matrix<double,3,3> Ji, Jj;
@@ -104,13 +109,13 @@ bool gaussNewtonStep(std::vector<Pose2>& X, const std::vector<Edge2>& edges, dou
     if (damping > 0.0) {
         for (int k = 0; k < D; ++k) H.coeffRef(k,k) += damping;
     }
-    // Fix first pose
+    // Fix oldest pose in window as anchor (gauge fix)
     for (int k = 0; k < 3; ++k) { H.coeffRef(k, k) += 1e12; b[k] = 0.0; }
 
     Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver(H);
     if (solver.info() != Eigen::Success) return false;
     Eigen::VectorXd dx = solver.solve(-b);
-    for (int i = 0; i < N; ++i) applyIncrement(X[i], dx.segment<3>(3*i));
+    for (int i = 0; i < N; ++i) applyIncrement(W[i], dx.segment<3>(3*i));
     return true;
 }
 
@@ -126,79 +131,62 @@ public:
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
         
         // Initialize the first pose at the origin
-        if (X.empty()) {
-            X.push_back({0.0, 0.0, 0.0}); 
-        }
+        W_.push_back({0.0, 0.0, 0.0});
         
         RCLCPP_INFO(this->get_logger(), "PGO Backend Initialized. Listening to Fused EKF Odometry.");
     }
 
 private:
+    void marginalize() {
+        // Remove the sequential edge (0,1) — the only edge incident to local index 0
+        W_edges_.erase(
+            std::remove_if(W_edges_.begin(), W_edges_.end(),
+                [](const Edge2& e){ return e.i == 0 || e.j == 0; }),
+            W_edges_.end());
+        // Drop oldest pose from front of window
+        W_.pop_front();
+        // Shift all window-local indices down by 1
+        for (auto& e : W_edges_) { e.i--; e.j--; }
+    }
+
     void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
-        // Extract fused position
+        if (W_.empty()) return;
+
         double cur_x = msg->pose.pose.position.x;
         double cur_y = msg->pose.pose.position.y;
-        
-        // Extract fused orientation (Yaw) from Quaternion
         double qz = msg->pose.pose.orientation.z;
         double qw = msg->pose.pose.orientation.w;
         double cur_th = std::atan2(2.0 * qw * qz, 1.0 - 2.0 * qz * qz);
 
-        Pose2 last = X.back();
-        
-        // Keyframe Trigger: Add a node if we've moved > 0.3m OR rotated > 15 degrees
-        double travel_dist = std::hypot(cur_x - last.x, cur_y - last.y);
+        Pose2 last = W_.back();
+
+        double travel_dist   = std::hypot(cur_x - last.x, cur_y - last.y);
         double rotation_dist = std::abs(wrapAngle(cur_th - last.th));
 
-        if (travel_dist > 0.3 || rotation_dist > 0.26) { // ~15 degrees
-            // Calculate the relative transform (The "Edge")
+        if (travel_dist > 0.3 || rotation_dist > 0.26) {
             Eigen::Vector3d z(cur_x - last.x, cur_y - last.y, wrapAngle(cur_th - last.th));
-            X.push_back({cur_x, cur_y, cur_th});
-            
-            // Information Matrix (Weights): We trust rotation (IMU) more than translation (LiDAR)
+            W_.push_back({cur_x, cur_y, cur_th});
+
             Eigen::Matrix3d info = Eigen::Matrix3d::Identity();
-            info(0,0) = 500.0;  // X weight
-            info(1,1) = 500.0;  // Y weight
-            info(2,2) = 3000.0; // Yaw weight (Higher because of IMU stability)
+            info(0,0) = 500.0;
+            info(1,1) = 500.0;
+            info(2,2) = 3000.0;
 
-            edges.push_back({(int)X.size()-2, (int)X.size()-1, z, info});
-            
-            // Run 5 iterations of Gauss-Newton to smooth the graph
+            // Window-local indices: safe because push_back guarantees W_.size() >= 2
+            W_edges_.push_back({(int)W_.size()-2, (int)W_.size()-1, z, info});
+
+            // Slide the window: marginalize oldest pose when over capacity
+            if ((int)W_.size() > WINDOW_SIZE) {
+                marginalize();
+            }
+
+            // Optimize the bounded window
             for (int it = 0; it < 5; ++it) {
-                gaussNewtonStep(X, edges, 1e-6);
+                gaussNewtonStep(W_, W_edges_, 1e-6);
             }
 
-            RCLCPP_INFO(this->get_logger(), "Added Keyframe %ld. Optimization complete.", X.size());
-
-            // --- RADIUS SEARCH FOR LOOP CLOSURE ---
-            // Ensure we have enough history to actually "loop"
-            if (X.size() > 20) {
-                int current_idx = (int)X.size() - 1;
-                Pose2 current_pose = X[current_idx];
-
-                // Search backwards, skipping the last 10 nodes (don't match with immediate past)
-                for (int i = 0; i < current_idx - 10; ++i) {
-                    double dist = std::hypot(current_pose.x - X[i].x, current_pose.y - X[i].y);
-                    
-                    // If an old node is within a 1.0 meter radius
-                    if (dist < 1.0) {
-                        RCLCPP_INFO(this->get_logger(), 
-                            "\n====================================\n"
-                            "LOOP CLOSURE CANDIDATE FOUND!\n"
-                            "Current Node: %d is near Old Node: %d\n"
-                            "Distance: %.2f meters\n"
-                            "====================================\n", 
-                            current_idx, i, dist);
-                        
-                        // NOTE: We only log it right now. To actually close the loop, 
-                        // we must send a request to the ICP node to see if the current 
-                        // LiDAR scan matches Node i's LiDAR scan.
-                        
-                        break; // Stop searching once we find one good candidate per keyframe
-                    }
-                }
-            }
-            // -------------------------------------------
+            RCLCPP_INFO(this->get_logger(),
+                "Keyframe added. Window: %zu poses, %zu edges", W_.size(), W_edges_.size());
         }
 
         // Always publish the map->odom transform to keep the TF tree linked
@@ -206,9 +194,9 @@ private:
     }
 
     void publish_correction(double fused_x, double fused_y, double fused_th) {
-        // The correction is the difference between our Optimized map pose 
+        // The correction is the difference between our Optimized map pose
         // and the EKF's current fused odometry pose.
-        Pose2 opt = X.back();
+        Pose2 opt = W_.back();
         
         geometry_msgs::msg::TransformStamped t;
         t.header.stamp = this->get_clock()->now();
@@ -232,8 +220,8 @@ private:
 
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
-    std::vector<Pose2> X;
-    std::vector<Edge2> edges;
+    std::deque<Pose2>  W_;
+    std::vector<Edge2> W_edges_;
 };
 
 
