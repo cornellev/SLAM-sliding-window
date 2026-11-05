@@ -1,0 +1,30 @@
+pgo_backend:
+  ros__parameters:
+    odom_topic: /odometry/filtered
+    scan_topic: /scan
+    map_frame: map
+    odom_frame: odom
+    base_frame: base_link
+
+    # Sliding window
+    window_size: 20               # keyframes kept in the optimizer
+    use_marginalization: true     # false = old behaviour (drop + hard-pin), for comparison only
+    keyframe_translation: 0.3     # m
+    keyframe_rotation: 0.26       # rad (~15 deg)
+
+    # Scan matching (local constraints inside the window + loop closure vs archive)
+    use_scan_matching: true
+    icp_method: trimmed
+    icp_overlap_rate: 0.7
+    match_min_fitness: 0.6
+    match_max_rmse: 0.06
+    local_match_radius: 3.0
+    max_local_matches: 3
+    loop_search_radius: 3.0
+    loop_min_keyframe_gap: 30
+
+    # Scan preprocessing
+    scan_min_range: 0.15
+    scan_max_range: 10.0
+    scan_voxel: 0.05
+    odom_max_gap: 0.2             # s, max gap between odometry samples to interpolate a scan's pose

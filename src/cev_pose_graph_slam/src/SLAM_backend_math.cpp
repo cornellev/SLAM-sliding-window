@@ -1,231 +1,227 @@
-#include <Eigen/Core>
-#include <Eigen/SparseCore>
-#include <Eigen/SparseCholesky>
-#include <cmath>
-#include <iostream>
-#include <vector>
-#include <memory>
-#include <deque>
+// ROS 2 front end for the sliding-window pose graph backend.
+//
+//   /odometry/filtered (EKF: ICP odometry + IMU) --> odometry edges (interpolated to scan time)
+//   /scan                                         --> keyframes, scan-matching edges, loop closures
+//   publishes TF map -> odom, and /slam/path (all keyframe estimates)
+//
+// All of the math lives in sliding_window_pgo.cpp so it can be tested without ROS
+// (see test/sim_test.cpp).
+
+#include "cev_pose_graph_slam/icp_scan_matcher.hpp"
+#include "cev_pose_graph_slam/sliding_window_pgo.hpp"
+
 #include <algorithm>
+#include <cmath>
+#include <deque>
+#include <memory>
 
-static constexpr int WINDOW_SIZE = 20;
-
-#include "rclcpp/rclcpp.hpp"
-#include "nav_msgs/msg/odometry.hpp"
+#include "geometry_msgs/msg/pose_stamped.hpp"
 #include "geometry_msgs/msg/transform_stamped.hpp"
-#include "tf2_ros/transform_broadcaster.h"
+#include "nav_msgs/msg/odometry.hpp"
+#include "nav_msgs/msg/path.hpp"
+#include "rclcpp/rclcpp.hpp"
+#include "sensor_msgs/msg/laser_scan.hpp"
 #include "tf2/LinearMath/Quaternion.h"
+#include "tf2/exceptions.h"
+#include "tf2_ros/buffer.h"
+#include "tf2_ros/transform_broadcaster.h"
+#include "tf2_ros/transform_listener.h"
 
-// --- Math Helpers ---
+using namespace cev_slam;
 
-static inline double wrapAngle(double a) {
-    a = std::fmod(a + M_PI, 2.0 * M_PI);
-    if (a < 0) a += 2.0 * M_PI;
-    return a - M_PI;
+static double yawFromQuat(const geometry_msgs::msg::Quaternion& q) {
+    return std::atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
 }
 
-struct Pose2 {
-    double x = 0, y = 0, th = 0;
-};
-
-struct Edge2 {
-    int i = 0, j = 0;
-    Eigen::Vector3d z;      
-    Eigen::Matrix3d Omega;
-};
-
-static inline Eigen::Matrix2d R(double th) {
-    double c = std::cos(th), s = std::sin(th);
-    Eigen::Matrix2d M;
-    M << c, -s, s, c;
-    return M;
+static geometry_msgs::msg::Quaternion quatFromYaw(double yaw) {
+    tf2::Quaternion q;
+    q.setRPY(0, 0, yaw);
+    geometry_msgs::msg::Quaternion out;
+    out.x = q.x();
+    out.y = q.y();
+    out.z = q.z();
+    out.w = q.w();
+    return out;
 }
-
-static inline Eigen::Vector3d computeError(const Pose2& xi, const Pose2& xj, const Eigen::Vector3d& z) {
-    Eigen::Vector2d ti(xi.x, xi.y), tj(xj.x, xj.y);
-    Eigen::Vector2d dt = tj - ti;
-    Eigen::Vector2d trans_err = R(xi.th).transpose() * dt - z.head<2>();
-    double rot_err = wrapAngle((xj.th - xi.th) - z[2]);
-    Eigen::Vector3d e;
-    e << trans_err, rot_err;
-    return e;
-}
-
-static inline void computeJacobians(
-    const Pose2& xi, const Pose2& xj,
-    Eigen::Matrix<double,3,3>& Ji, Eigen::Matrix<double,3,3>& Jj)
-{
-    Ji.setZero(); Jj.setZero();
-    Eigen::Matrix2d RiT = R(xi.th).transpose();
-    Ji.block<2,2>(0,0) = -RiT;
-    Jj.block<2,2>(0,0) =  RiT;
-    double c = std::cos(xi.th), s = std::sin(xi.th);
-    Eigen::Matrix2d dRiT;
-    dRiT << -s, c, -c, -s;
-    Eigen::Vector2d dt(xj.x - xi.x, xj.y - xi.y);
-    Eigen::Vector2d d = dRiT * dt;
-    Ji(0,2) = d[0]; Ji(1,2) = d[1];
-    Ji(2,2) = -1.0; Jj(2,2) = 1.0;
-}
-
-static inline void applyIncrement(Pose2& x, const Eigen::Vector3d& dx) {
-    x.x += dx[0];
-    x.y += dx[1];
-    x.th = wrapAngle(x.th + dx[2]);
-}
-
-bool gaussNewtonStep(std::deque<Pose2>& W, const std::vector<Edge2>& edges, double damping = 0.0) {
-    if (W.size() < 2) return false;
-    const int N = static_cast<int>(W.size());
-    const int D = 3 * N;
-    std::vector<Eigen::Triplet<double>> trips;
-    Eigen::VectorXd b = Eigen::VectorXd::Zero(D);
-
-    auto addBlock = [&](int r0, int c0, const Eigen::Matrix3d& M) {
-        for (int r = 0; r < 3; ++r)
-            for (int c = 0; c < 3; ++c)
-                if (std::abs(M(r,c)) > 1e-12)
-                    trips.emplace_back(r0 + r, c0 + c, M(r,c));
-    };
-
-    double chi2 = 0.0;
-    for (const auto& e : edges) {
-        const Pose2& xi = W[e.i];
-        const Pose2& xj = W[e.j];
-        Eigen::Vector3d err = computeError(xi, xj, e.z);
-        chi2 += err.transpose() * e.Omega * err;
-        Eigen::Matrix<double,3,3> Ji, Jj;
-        computeJacobians(xi, xj, Ji, Jj);
-        addBlock(3*e.i, 3*e.i, Ji.transpose() * e.Omega * Ji);
-        addBlock(3*e.i, 3*e.j, Ji.transpose() * e.Omega * Jj);
-        addBlock(3*e.j, 3*e.i, Jj.transpose() * e.Omega * Ji);
-        addBlock(3*e.j, 3*e.j, Jj.transpose() * e.Omega * Jj);
-        b.segment<3>(3*e.i) += Ji.transpose() * e.Omega * err;
-        b.segment<3>(3*e.j) += Jj.transpose() * e.Omega * err;
-    }
-
-    Eigen::SparseMatrix<double> H(D, D);
-    H.setFromTriplets(trips.begin(), trips.end());
-    if (damping > 0.0) {
-        for (int k = 0; k < D; ++k) H.coeffRef(k,k) += damping;
-    }
-    // Fix oldest pose in window as anchor (gauge fix)
-    for (int k = 0; k < 3; ++k) { H.coeffRef(k, k) += 1e12; b[k] = 0.0; }
-
-    Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver(H);
-    if (solver.info() != Eigen::Success) return false;
-    Eigen::VectorXd dx = solver.solve(-b);
-    for (int i = 0; i < N; ++i) applyIncrement(W[i], dx.segment<3>(3*i));
-    return true;
-}
-
-// --- ROS 2 Node ---
 
 class PgoNode : public rclcpp::Node {
 public:
-    PgoNode() : Node("pgo_backend") {
-        // STEP 1: Change subscription from "/odom" to "/odometry/filtered"
-        odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-            "/odometry/filtered", 10, std::bind(&PgoNode::odom_callback, this, std::placeholders::_1));
-        
+    PgoNode(): Node("pgo_backend") {
+        map_frame_ = declare_parameter("map_frame", "map");
+        odom_frame_ = declare_parameter("odom_frame", "odom");
+        base_frame_ = declare_parameter("base_frame", "base_link");
+        odom_max_gap_ = declare_parameter("odom_max_gap", 0.2);
+        min_range_ = declare_parameter("scan_min_range", 0.15);
+        max_range_ = declare_parameter("scan_max_range", 10.0);
+        voxel_ = declare_parameter("scan_voxel", 0.05);
+
+        Params p;
+        p.window_size = declare_parameter("window_size", p.window_size);
+        p.kf_trans = declare_parameter("keyframe_translation", p.kf_trans);
+        p.kf_rot = declare_parameter("keyframe_rotation", p.kf_rot);
+        p.local_radius = declare_parameter("local_match_radius", p.local_radius);
+        p.max_local_matches = declare_parameter("max_local_matches", p.max_local_matches);
+        p.loop_radius = declare_parameter("loop_search_radius", p.loop_radius);
+        p.loop_min_gap = declare_parameter("loop_min_keyframe_gap", p.loop_min_gap);
+        if (!declare_parameter("use_marginalization", true)) p.mode = WindowMode::Truncate;
+
+        IcpScanMatcher::Config mc;
+        mc.method = declare_parameter("icp_method", mc.method);
+        mc.overlap_rate = declare_parameter("icp_overlap_rate", mc.overlap_rate);
+        mc.min_fitness = declare_parameter("match_min_fitness", mc.min_fitness);
+        mc.max_rmse = declare_parameter("match_max_rmse", mc.max_rmse);
+
+        ScanMatcher matcher;
+        scan_matching_ = declare_parameter("use_scan_matching", true);
+        if (scan_matching_)
+            matcher = IcpScanMatcher::asFunction(std::make_shared<IcpScanMatcher>(mc));
+        pgo_ = std::make_unique<SlidingWindowPGO>(p, matcher);
+
+        tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
+        tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
-        
-        // Initialize the first pose at the origin
-        W_.push_back({0.0, 0.0, 0.0});
-        
-        RCLCPP_INFO(this->get_logger(), "PGO Backend Initialized. Listening to Fused EKF Odometry.");
+        path_pub_ = create_publisher<nav_msgs::msg::Path>("slam/path", rclcpp::QoS(1).transient_local());
+
+        odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+            declare_parameter("odom_topic", "/odometry/filtered"), 50,
+            std::bind(&PgoNode::odomCallback, this, std::placeholders::_1));
+        scan_sub_ = create_subscription<sensor_msgs::msg::LaserScan>(
+            declare_parameter("scan_topic", "/scan"), rclcpp::SensorDataQoS(),
+            std::bind(&PgoNode::scanCallback, this, std::placeholders::_1));
+
+        RCLCPP_INFO(get_logger(), "Sliding-window PGO ready (window=%d, %s, scan matching %s)",
+            p.window_size, p.mode == WindowMode::Marginalize ? "marginalization" : "truncation",
+            matcher ? "on" : "off");
     }
 
 private:
-    void marginalize() {
-        // Remove the sequential edge (0,1) — the only edge incident to local index 0
-        W_edges_.erase(
-            std::remove_if(W_edges_.begin(), W_edges_.end(),
-                [](const Edge2& e){ return e.i == 0 || e.j == 0; }),
-            W_edges_.end());
-        // Drop oldest pose from front of window
-        W_.pop_front();
-        // Shift all window-local indices down by 1
-        for (auto& e : W_edges_) { e.i--; e.j--; }
-    }
-
-    void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
-        if (W_.empty()) return;
-
-        double cur_x = msg->pose.pose.position.x;
-        double cur_y = msg->pose.pose.position.y;
-        double qz = msg->pose.pose.orientation.z;
-        double qw = msg->pose.pose.orientation.w;
-        double cur_th = std::atan2(2.0 * qw * qz, 1.0 - 2.0 * qz * qz);
-
-        Pose2 last = W_.back();
-
-        double travel_dist   = std::hypot(cur_x - last.x, cur_y - last.y);
-        double rotation_dist = std::abs(wrapAngle(cur_th - last.th));
-
-        if (travel_dist > 0.3 || rotation_dist > 0.26) {
-            double c = std::cos(last.th), s = std::sin(last.th);
-            double dx = cur_x - last.x, dy = cur_y - last.y;
-            Eigen::Vector3d z(c*dx + s*dy, -s*dx + c*dy, wrapAngle(cur_th - last.th));
-            W_.push_back({cur_x, cur_y, cur_th});
-
-            Eigen::Matrix3d info = Eigen::Matrix3d::Identity();
-            info(0,0) = 500.0;
-            info(1,1) = 500.0;
-            info(2,2) = 3000.0;
-
-            // Window-local indices: safe because push_back guarantees W_.size() >= 2
-            W_edges_.push_back({(int)W_.size()-2, (int)W_.size()-1, z, info});
-
-            // Slide the window: marginalize oldest pose when over capacity
-            if ((int)W_.size() > WINDOW_SIZE) {
-                marginalize();
+    void scanCallback(const sensor_msgs::msg::LaserScan::SharedPtr msg) {
+        // laser -> base_link, looked up once (static on the car).
+        if (!laser_to_base_) {
+            try {
+                auto t = tf_buffer_->lookupTransform(base_frame_, msg->header.frame_id, tf2::TimePointZero);
+                laser_to_base_ = Pose2{t.transform.translation.x, t.transform.translation.y,
+                    yawFromQuat(t.transform.rotation)};
+            } catch (const tf2::TransformException& ex) {
+                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                    "No TF %s -> %s yet (%s); dropping scan", base_frame_.c_str(),
+                    msg->header.frame_id.c_str(), ex.what());
+                return;
             }
-
-            // Optimize the bounded window
-            for (int it = 0; it < 5; ++it) {
-                gaussNewtonStep(W_, W_edges_, 1e-6);
-            }
-
-            RCLCPP_INFO(this->get_logger(),
-                "Keyframe added. Window: %zu poses, %zu edges", W_.size(), W_edges_.size());
         }
-
-        // Always publish the map->odom transform to keep the TF tree linked
-        publish_correction(cur_x, cur_y, cur_th);
+        PointList pts;
+        pts.reserve(msg->ranges.size());
+        for (size_t i = 0; i < msg->ranges.size(); ++i) {
+            float r = msg->ranges[i];
+            if (!std::isfinite(r) || r < msg->range_min || r > msg->range_max) continue;
+            double a = msg->angle_min + i * msg->angle_increment;
+            pts.push_back(transformPoint(*laser_to_base_, Point(r * std::cos(a), r * std::sin(a))));
+        }
+        pending_scans_.emplace_back(rclcpp::Time(msg->header.stamp).seconds(),
+            filterScan(pts, min_range_, max_range_, voxel_));
+        if (pending_scans_.size() > 10) pending_scans_.pop_front();
+        processPendingScans();
     }
 
-    void publish_correction(double fused_x, double fused_y, double fused_th) {
-        // The correction is the difference between our Optimized map pose
-        // and the EKF's current fused odometry pose.
-        Pose2 opt = W_.back();
-        
+    void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
+        const auto& pp = msg->pose.pose;
+        Pose2 odom{pp.position.x, pp.position.y, yawFromQuat(pp.orientation)};
+        double stamp = rclcpp::Time(msg->header.stamp).seconds();
+
+        if (!scan_matching_) {
+            addKeyframeCandidate(odom, stamp, {});
+        } else {
+            odom_buf_.emplace_back(stamp, odom);
+            while (odom_buf_.size() > 2 && odom_buf_.front().first < stamp - 2.0) odom_buf_.pop_front();
+            processPendingScans();
+        }
+        publishMapToOdom(msg->header.stamp);
+    }
+
+    // Keyframes are taken at scan times: odometry is interpolated to the scan stamp, so the scan
+    // and the pose it is attached to describe the same instant. (Pairing a scan with whatever
+    // odometry message arrives next biases every scan-matching edge by up to one scan period.)
+    void processPendingScans() {
+        while (!pending_scans_.empty() && !odom_buf_.empty()) {
+            auto& [ts, scan] = pending_scans_.front();
+            if (ts > odom_buf_.back().first) return;  // wait for odometry to catch up
+            if (ts < odom_buf_.front().first) {        // too old to interpolate
+                pending_scans_.pop_front();
+                continue;
+            }
+            auto hi = std::lower_bound(odom_buf_.begin(), odom_buf_.end(), ts,
+                [](const auto& o, double t) { return o.first < t; });
+            auto lo = hi == odom_buf_.begin() ? hi : std::prev(hi);
+            if (hi->first - lo->first <= odom_max_gap_) {
+                double a = hi->first > lo->first ? (ts - lo->first) / (hi->first - lo->first) : 0.0;
+                const Pose2 &p0 = lo->second, &p1 = hi->second;
+                Pose2 odom{p0.x + a * (p1.x - p0.x), p0.y + a * (p1.y - p0.y),
+                    wrapAngle(p0.th + a * wrapAngle(p1.th - p0.th))};
+                addKeyframeCandidate(odom, ts, scan);
+            }
+            pending_scans_.pop_front();
+        }
+    }
+
+    void addKeyframeCandidate(const Pose2& odom, double stamp, const PointList& scan) {
+        auto before = pgo_->stats();
+        if (!pgo_->addOdometry(odom, stamp, scan)) return;
+        const auto& s = pgo_->stats();
+        if (s.loop_edges > before.loop_edges)
+            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000, "Loop closure at keyframe %d (%d total)",
+                pgo_->window().back().id, s.loop_edges);
+        RCLCPP_DEBUG(get_logger(), "KF %d | window %zu | scan edges %d | rejected %d | chi2 %.2f (%d it)",
+            pgo_->window().back().id, pgo_->window().size(), s.scan_edges, s.rejected_matches,
+            s.last_chi2, s.last_iterations);
+        publishPath(rclcpp::Time(static_cast<int64_t>(stamp * 1e9)));
+    }
+
+    void publishMapToOdom(const builtin_interfaces::msg::Time& stamp) {
+        const Pose2& T = pgo_->mapToOdom();
         geometry_msgs::msg::TransformStamped t;
-        t.header.stamp = this->get_clock()->now();
-        t.header.frame_id = "map";
-        t.child_frame_id = "odom";
-
-        // Math: T_map_to_odom = T_map_to_base * inv(T_odom_to_base)
-        t.transform.translation.x = opt.x - fused_x;
-        t.transform.translation.y = opt.y - fused_y;
-        t.transform.translation.z = 0.0;
-
-        tf2::Quaternion q;
-        q.setRPY(0, 0, wrapAngle(opt.th - fused_th));
-        t.transform.rotation.x = q.x();
-        t.transform.rotation.y = q.y();
-        t.transform.rotation.z = q.z();
-        t.transform.rotation.w = q.w();
-
+        t.header.stamp = stamp;  // stamp of the odometry it was computed from, not now()
+        t.header.frame_id = map_frame_;
+        t.child_frame_id = odom_frame_;
+        t.transform.translation.x = T.x;
+        t.transform.translation.y = T.y;
+        t.transform.rotation = quatFromYaw(T.th);
         tf_broadcaster_->sendTransform(t);
     }
 
-    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
-    std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
-    std::deque<Pose2>  W_;
-    std::vector<Edge2> W_edges_;
-};
+    void publishPath(const builtin_interfaces::msg::Time& stamp) {
+        nav_msgs::msg::Path path;
+        path.header.stamp = stamp;
+        path.header.frame_id = map_frame_;
+        auto add = [&](const Keyframe& kf) {
+            geometry_msgs::msg::PoseStamped ps;
+            ps.header.frame_id = map_frame_;
+            ps.header.stamp = rclcpp::Time(static_cast<int64_t>(kf.stamp * 1e9));
+            ps.pose.position.x = kf.est.x;
+            ps.pose.position.y = kf.est.y;
+            ps.pose.orientation = quatFromYaw(kf.est.th);
+            path.poses.push_back(ps);
+        };
+        for (const auto& kf: pgo_->archive()) add(kf);
+        for (const auto& kf: pgo_->window()) add(kf);
+        path_pub_->publish(path);
+    }
 
+    std::string map_frame_, odom_frame_, base_frame_;
+    double odom_max_gap_, min_range_, max_range_, voxel_;
+    bool scan_matching_ = true;
+
+    std::unique_ptr<SlidingWindowPGO> pgo_;
+    std::optional<Pose2> laser_to_base_;
+    std::deque<std::pair<double, Pose2>> odom_buf_;          // (stamp, odom pose), last ~2 s
+    std::deque<std::pair<double, PointList>> pending_scans_;  // (stamp, base-frame points)
+
+    std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+    std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+    rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
+};
 
 int main(int argc, char** argv) {
     rclcpp::init(argc, argv);
